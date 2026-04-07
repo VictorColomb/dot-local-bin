@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+#MISE description="Install executables in ~/.local/bin"
+#MISE alias="i"
+#USAGE flag "-l --symlink" help="Create symlinks instead of copying"
+#USAGE arg "[name]" var=#true help="Executable(s) to install (default: all)"
+
+set -euo pipefail
+
+DEST="$HOME/.local/bin"
+SRC="$(git rev-parse --show-toplevel)/src"
+
+if [[ -n "${usage_name:-}" ]]; then
+  eval "files=($usage_name)"
+else
+  mapfile -t files < <(ls "$SRC")
+fi
+
+mkdir -p "$DEST"
+
+for name in "${files[@]}"; do
+  src="$SRC/$name"
+  dest="$DEST/$name"
+
+  if [[ ! -e "$src" ]]; then
+    echo "error: '$name' not found in $SRC" >&2
+    exit 1
+  fi
+
+  rm -f "$dest"
+
+  if [[ "${usage_symlink:-false}" == "true" ]]; then
+    ln -s "$src" "$dest"
+    echo "symlinked $name"
+  else
+    cp "$src" "$dest"
+    echo "installed $name"
+  fi
+done
