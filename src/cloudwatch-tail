@@ -47,6 +47,6 @@ command="aws logs tail '$LOG_GROUP_NAME' --follow --format short"
 command+=" | awk '{print substr(\$0, 21)}'"
 [[ -n "$JSON" ]] && command+=" | jq -r '$JSON'"
 
-echo "$command"
-echo
+echo "$command" >&2
+echo >&2
 bash -c "$command"

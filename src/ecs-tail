@@ -4,7 +4,7 @@
 # Author: Victor Colomb <victor@tarmactechnologies.com>
 # Copyright (c) 2026 Tarmac Technologies
 
-## Usage: ecr-build-push [options] <ecs-task-id>
+## Usage: ecs-tail [options] <ecs-task-id>
 ##
 ## Options:
 ##	-h|--help:                   Display this help message and exit
@@ -53,7 +53,7 @@ esac; shift; done
 
 # === Describe Task ===
 
-task_description=$(eval "aws ecs describe-tasks --output json --cluster '$CLUSTER' --tasks '$TASK'")
+task_description=$(aws ecs describe-tasks --output json --cluster "$CLUSTER" --tasks "$TASK")
 
 if [[ "$(echo "$task_description" | jq -r '.failures | length')" -gt 0 ]]; then
 	echo "Could not retrieve task, reason: $(echo "$task_description" | jq -r '.failures[0].reason')" >&2
@@ -64,7 +64,7 @@ task_arn=$(echo "$task_description" | jq -r '.tasks[0].taskArn')
 task_definition_arn=$(echo "$task_description" | jq -r '.tasks[0].taskDefinitionArn')
 task_id="${task_arn##*/}"
 
-container_definitions=$(eval "aws ecs describe-task-definition --output json --task-definition '$task_definition_arn' --query 'taskDefinition.containerDefinitions'")
+container_definitions=$(aws ecs describe-task-definition --output json --task-definition "$task_definition_arn" --query 'taskDefinition.containerDefinitions')
 
 
 # === Tail Container Logs ===
@@ -102,7 +102,7 @@ done
 retry_count=0
 while [[ "$retry_count" -lt "$RETRIES" ]]; do
 	sleep 5
-	task_description=$(eval "aws ecs describe-tasks --output json --cluster '$CLUSTER' --tasks '$TASK'")
+	task_description=$(aws ecs describe-tasks --output json --cluster "$CLUSTER" --tasks "$TASK")
 	[[ "$(echo "$task_description" | jq -r '.tasks[0].lastStatus')" == "STOPPED" ]] && break
 
 	retry_count=$((retry_count + 1))
@@ -133,8 +133,8 @@ done
 width=$(tput cols 2>/dev/null || echo 80)
 printf '%b%*s%b\n' "$color" "$width" "" "\033[0m" | tr ' ' '='
 
-for key in "${!sounds[@]}"; do
-	echo "Container $key failed with exit code ${sounds[$key]}"
+for key in "${!exit_codes[@]}"; do
+	echo "Container $key failed with exit code ${exit_codes[$key]}"
 done
 
 [[ "$failed" -eq 1 ]] && exit 3

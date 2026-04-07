@@ -76,14 +76,14 @@ AWS_REGION="${AWS_REGION:-$(aws configure get region)}"
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$TT__ECR_REPO:$TAG"
 
-EXISTING_IMAGE=$(aws ecr batch-get-image --region $AWS_REGION --repository-name=$TT__ECR_REPO --image-ids=imageTag=$TAG | jq -r '.images | length')
+EXISTING_IMAGE=$(aws ecr batch-get-image --region "$AWS_REGION" --repository-name="$TT__ECR_REPO" --image-ids=imageTag="$TAG" | jq -r '.images | length')
 [[ $TT__OVERWRITE == true ]] && EXISTING_IMAGE=0
 
 if [[ $EXISTING_IMAGE -eq 0 ]]; then
 	echo -e "${GREEN}Building and pushing Docker image...${RESET}"
 
-	aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
-	docker buildx build --tag "$IMAGE" --platform $TT__PLATFORM --push .
+	aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+	docker buildx build --tag "$IMAGE" --platform "$TT__PLATFORM" --push .
 else
 	echo -e "${GREEN}Docker image already exists${RESET}"
 fi
@@ -93,18 +93,18 @@ fi
 
 echo -e "${GREEN}Updating ECS Task Definition...${RESET}"
 
-aws ssm put-parameter --region $AWS_REGION --name "/ecs/$TT__ECS_CLUSTER/$TT__ECS_TASK_DEFINITION/image_tag" --value $TAG --overwrite > /dev/null
+aws ssm put-parameter --region "$AWS_REGION" --name "/ecs/$TT__ECS_CLUSTER/$TT__ECS_TASK_DEFINITION/image_tag" --value "$TAG" --overwrite > /dev/null
 
-TASK_DEFINITION=$(aws ecs describe-task-definition --region $AWS_REGION --task-definition "$TT__ECS_TASK_DEFINITION")
-NEW_TASK_DEFINITION=$(echo $TASK_DEFINITION | jq --arg IMAGE "$IMAGE" '.taskDefinition | .containerDefinitions[-1].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
-NEW_TASK=$(aws ecs register-task-definition --region $AWS_REGION --cli-input-json "$NEW_TASK_DEFINITION")
-NEW_TASK_REVISION=$(echo $NEW_TASK | jq -r '.taskDefinition.revision')
+TASK_DEFINITION=$(aws ecs describe-task-definition --region "$AWS_REGION" --task-definition "$TT__ECS_TASK_DEFINITION")
+NEW_TASK_DEFINITION=$(jq --arg IMAGE "$IMAGE" '.taskDefinition | .containerDefinitions[-1].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' <<< "$TASK_DEFINITION")
+NEW_TASK=$(aws ecs register-task-definition --region "$AWS_REGION" --cli-input-json "$NEW_TASK_DEFINITION")
+NEW_TASK_REVISION=$(jq -r '.taskDefinition.revision' <<< "$NEW_TASK")
 
 
 # === Update ECS Service ===
 
-if [[ -n $TT__ECS_SERVICE ]]; then
+if [[ -n "$TT__ECS_SERVICE" ]]; then
 	echo -e "${GREEN}Updating ECS Service...${RESET}"
-	aws ecs update-service --region $AWS_REGION --cluster "$TT__ECS_CLUSTER" --service "$TT__ECS_SERVICE" --task-definition "$TT__ECS_TASK_DEFINITION:$NEW_TASK_REVISION" > /dev/null
+	aws ecs update-service --region "$AWS_REGION" --cluster "$TT__ECS_CLUSTER" --service "$TT__ECS_SERVICE" --task-definition "$TT__ECS_TASK_DEFINITION:$NEW_TASK_REVISION" > /dev/null
 	echo -e "${GREEN}All done!${RESET}"
 fi

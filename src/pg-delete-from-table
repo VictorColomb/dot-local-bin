@@ -14,12 +14,13 @@
 ## Optional options:
 ##  --help: Display this help message and exit.
 ##  -h|--host [host]: Hostname or IP address of the PostgreSQL server [default: 127.0.0.1]
-##  -p|--port [port]: Port number of the PostgreSQL server [default: 5432]
+##  --port [port]: Port number of the PostgreSQL server [default: 5432]
 ##  -b|--batch-size [size]: Batch size for deletion [default: 1000]
 ##  -k|--primary-key [column_name]: Name of the primary key column [default: id]
 ##  -m|--min [value]: Minimum value for the primary key
 ##  -M|--max [value]: Maximum value for the primary key
 ##  -p|--password [password]: Password for the PostgreSQL server. If not provided, the script will prompt for it.
+##                            Note: use --port (no short flag) to set the port.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -58,7 +59,7 @@ while [[ "$1" =~ ^- ]]; do case $1 in
 		shift
 		DB_NAME=$1
 		;;
-	-p | --port)
+	--port)
 		shift
 		PORT=$1
 		;;
@@ -115,7 +116,7 @@ CURRENT_ID=$MIN_ID
 # === Delete in batches ===
 
 while [ "$CURRENT_ID" -le "$MAX_ID" ]; do
-	local upper=$((CURRENT_ID + BATCH_SIZE - 1))
+	upper=$((CURRENT_ID + BATCH_SIZE - 1))
 	[[ $upper -gt $MAX_ID ]] && upper=$MAX_ID
 
 	psql -h "$HOST" -p "$PORT" -d "$DB_NAME" -U "$USERNAME" -c "
