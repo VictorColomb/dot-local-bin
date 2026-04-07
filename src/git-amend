@@ -29,5 +29,9 @@ if [[ -z "$FIXUP" ]]; then
 	git commit --amend --no-edit
 else
 	git commit --fixup="$FIXUP"
-	git rebase "$FIXUP^" --autosquash
+	if git rev-parse --verify "$FIXUP^" &>/dev/null; then
+		git rebase "$FIXUP^" --autosquash
+	else
+		git rebase --root --autosquash
+	fi
 fi
