@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
+#
+# Author: Victor Colomb <victor@tarmactechnologies.com>
+# Copyright (c) 2026 Tarmac Technologies
+
+## Usage: cloudwatch-tail [options] <log-group-name> [log-stream-name]
+##
+## Options:
+##	-h, --help           Display this help message and exit
+##	-j, --json [filter]  Only output this JSON key
+
+set -euo pipefail
+IFS=$'\n\t'
+
+usage() {
+	[ "$*" ] && echo "$*" && echo
+	sed -n '/^##/,/^$/s/^## \{0,1\}//p' "$0"
+} 2>/dev/null
+
+
+# === Parameters ===
+
+JSON=""
+
+set +u
+while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
+	-h | --help)
+		usage "Tail CloudWatch Logs without surrounding crap" 2>&1
+		exit 0
+		;;
+	-j | --json)
+		shift; JSON=$1
+		;;
+esac; shift; done
+[[ "$1" == '--' ]] && shift
+set -u
+
+[[ $# -eq 0 ]] && usage "[!] Missing log-group-name" >&2 && exit 1 || LOG_GROUP_NAME="$1"
+[[ $# -ge 2 ]] && LOG_STREAM_NAME="$2" || LOG_STREAM_NAME=""
+
+
+# === Tail CloudWatch Logs ===
+
+command="aws logs tail '$LOG_GROUP_NAME' --follow --format short"
+[[ -n "$LOG_STREAM_NAME" ]] && command+=" --log-stream-names '$LOG_STREAM_NAME'"
+command+=" | awk '{print substr(\$0, 21)}'"
+[[ -n "$JSON" ]] && command+=" | jq -r '$JSON'"
+
+echo "$command"
+echo
+bash -c "$command"

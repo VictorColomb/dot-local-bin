@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
+#
+# Author: Victor Colomb <victor@tarmactechnologies.com>
+# Copyright (c) 2026 Tarmac Technologies
+
+## Usage: git wt [options] [target-name]
+##
+## Options
+##	-h|--help:              Display this help message and exit
+##	-d|--delete:            Delete the specified worktree
+
+set -euo pipefail
+IFS=$'\n\t'
+
+usage() {
+	[ "$*" ] && echo "$*" && echo
+	sed -n '/^##/,/^$/s/^## \{0,1\}//p' "$0"
+} 2>/dev/null
+
+
+# === Parameters ===
+
+DELETE=0
+
+set +u
+while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
+	-h | --help)
+		echo "Create, open or delete a git worktree interactively." >&2
+		usage "Works well with Zed and VSCode IDEs." 1>&2
+		exit 0
+		;;
+	-d | --delete)
+		DELETE=1
+		;;
+	*)
+		usage "[!] Unknown option: $1" 1>&2
+		exit 1
+esac; shift; done
+[[ "$1" == '--' ]] && shift
+set -u
+
+[[ "$#" -eq 0 ]] && TARGET_NAME="" || TARGET_NAME="$1"
+
+
+# === Functions ===
+
+open_ide() {
+	[[ ${TERM_PROGRAM:-} == "vscode" ]] && code --reuse-window "$@"
+	[[ ${ZED_TERM:-} == "true" ]] && zed --reuse "$@"
+}
+
+delete_worktree() {
+	[[ -d "$1" ]] || { echo "[!] Worktree '$1' not found." >&2; return 1; }
+
+	if git --git-dir="$common_git_dir" --work-tree="$main_repo_root_path" worktree remove "$1"; then
+		echo "Worktree '$1' deleted."
+	else
+		echo "[!] 'git worktree remove' command failed." >&2
+		return 3
+	fi
+}
+
+create_worktree() {
+	# List branches from the main repository context
+	local branch_choice=$(git --git-dir="$common_git_dir" --work-tree="$main_repo_root_path" \
+		branch --format='%(refname:short)' | fzf --height 15% --reverse \
+		--prompt="Select source branch for '$1': ")
+
+	if [[ -n "$branch_choice" ]]; then
+		# Run git worktree add from the main repo context for consistency
+		if git --git-dir="$common_git_dir" --work-tree="$main_repo_root_path" worktree add "$1" "$branch_choice"; then
+			open_ide "$1"
+		else
+			echo "[!] 'git worktree add' command failed." >&2
+			# Simple cleanup attempt
+			if [[ -d "$1" ]] && ! ls -A "$1" | grep -qv '.git'; then
+				rmdir "$1" 2>/dev/null
+			fi
+			exit 3
+		fi
+	fi
+}
+
+process_worktree() {
+	if [[ $DELETE -eq 1 ]]; then
+		delete_worktree "$1"
+	elif git worktree list --porcelain | grep "^worktree " | cut -d ' ' -f 2- | grep -q "^${1}$"; then
+		open_ide "$1"
+	else
+		create_worktree "$1"
+	fi
+}
+
+prompt_worktree() {
+	options=$(git worktree list --porcelain | grep "^worktree " \
+		| cut -d ' ' -f 2- \
+		| awk -v base="$worktree_base_dir" '$0 ~ "^" base { sub(base, "", $0); print $0 }')
+
+	if [[ $DELETE -eq 0 ]]; then
+		options="-- Main worktree --\n$options"
+	fi
+
+	[[ -z "$options" ]] && return 1
+
+	selection=$(echo -e "$options" | fzf --height 25% --reverse --prompt="Select worktree: ")
+	echo "$selection"
+}
+
+
+# === Main ===
+
+# Determine main branch, git dir, main worktree dir and others
+common_git_dir_rel=$(git rev-parse --git-common-dir 2>/dev/null)
+common_git_dir=$(realpath "$common_git_dir_rel")
+if [[ -z "$common_git_dir" ]]; then
+	echo "[!] Operation must be performed within a Git repository or its worktree." >&2
+	exit 2
+fi
+
+main_repo_root_path=$(dirname "$common_git_dir")
+repo_name=$(basename "$main_repo_root_path")
+parent_dir=$(dirname "$main_repo_root_path")
+worktree_base_dir="${parent_dir}/${repo_name}."
+
+if git --git-dir="$common_git_dir" --work-tree="$main_repo_root_path" show-ref --verify --quiet refs/heads/main; then
+	main_branch="main"
+else
+	main_branch="master"
+fi
+
+# Do the stuff
+if [[ -z "$TARGET_NAME" ]]; then
+	TARGET_NAME=$(prompt_worktree) || \
+		{ usage "[!] No worktrees found. Provide target-name to create one" 1>&2; exit 2; }
+fi
+if [[ -z "$TARGET_NAME" ]]; then
+	exit 0
+fi
+
+if [[ "$TARGET_NAME" == "-- Main worktree --" ]]; then
+	process_worktree "${parent_dir}/${repo_name}"
+else
+	process_worktree "${worktree_base_dir}${TARGET_NAME}"
+fi

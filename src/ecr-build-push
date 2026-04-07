@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
+#
+# Author: Victor Colomb <victor@tarmactechnologies.com>
+# Copyright (c) 2026 Tarmac Technologies
+
+## Usage: ecr-build-push [options]
+##
+## Required options:
+##	-r|--repo [repo], TT__ECR_REPO: Set the ECR repository
+##	-c|--cluster [cluster], TT__ECS_CLUSTER: Set the ECS cluster
+##	-d|--task-definition [definition], TT__ECS_TASK_DEFINITION: Set the ECS task definition
+##
+## Optional options:
+##	-h|--help: Display this help message
+##	-o|--overwrite, TT__OVERWRITE: Overwrite ECR image tag
+##	-s|--service [service], TT__ECS_SERVICE: Set the ECS service
+##	-p|--platform [platform], TT__PLATFORM: ECS service platform [default: linux/arm64]
+
+set -euo pipefail
+IFS=$'\n\t'
+
+usage() {
+	[ "$*" ] && echo "$0: $*"
+	sed -n '/^##/,/^$/s/^## \{0,1\}//p' "$0"
+} 2>/dev/null
+
+GREEN="\033[32m"
+RESET="\033[0m"
+
+
+# === Parameters ===
+
+TT__ECS_SERVICE=""
+TT__OVERWRITE=false
+TT__PLATFORM="linux/arm64"
+
+set +u
+while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
+	-h | --help)
+		echo "Build docker image, push to ECR, and deploy to ECS"
+		usage 2>&1
+		exit 0
+		;;
+	-r | --repo)
+		shift; TT__ECR_REPO=$1
+		;;
+	-c | --cluster)
+		shift; TT__ECS_CLUSTER=$1
+		;;
+	-s | --service)
+		shift; TT__ECS_SERVICE=$1
+		;;
+	-d | --task-definition)
+		shift; TT__ECS_TASK_DEFINITION=$1
+		;;
+	-p | --platform)
+		shift; TT__PLATFORM=$1
+		;;
+	-o | --overwrite)
+		TT__OVERWRITE=true
+		;;
+esac; shift; done
+[[ "$1" == '--' ]] && shift
+
+[[ -z "$TT__ECR_REPO" ]] && echo "[!] TT__ECR_REPO, -r, or --repo is not set" >&2 && usage && exit 1
+[[ -z "$TT__ECS_CLUSTER" ]] && echo "[!] TT__ECS_CLUSTER, -c, or --cluster is not set" >&2 && usage && exit 1
+[[ -z "$TT__ECS_TASK_DEFINITION" ]] && echo "[!] TT__ECS_TASK_DEFINITION, -d, or --task-definition is not set" >&2 && usage && exit 1
+set -u
+
+
+# === Build and push to ECR ===
+
+TAG=$(git rev-parse HEAD)
+AWS_REGION="${AWS_REGION:-$(aws configure get region)}"
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$TT__ECR_REPO:$TAG"
+
+EXISTING_IMAGE=$(aws ecr batch-get-image --region $AWS_REGION --repository-name=$TT__ECR_REPO --image-ids=imageTag=$TAG | jq -r '.images | length')
+[[ $TT__OVERWRITE == true ]] && EXISTING_IMAGE=0
+
+if [[ $EXISTING_IMAGE -eq 0 ]]; then
+	echo -e "${GREEN}Building and pushing Docker image...${RESET}"
+
+	aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+	docker buildx build --tag "$IMAGE" --platform $TT__PLATFORM --push .
+else
+	echo -e "${GREEN}Docker image already exists${RESET}"
+fi
+
+
+# === Update ECS Task Definition ===
+
+echo -e "${GREEN}Updating ECS Task Definition...${RESET}"
+
+aws ssm put-parameter --region $AWS_REGION --name "/ecs/$TT__ECS_CLUSTER/$TT__ECS_TASK_DEFINITION/image_tag" --value $TAG --overwrite > /dev/null
+
+TASK_DEFINITION=$(aws ecs describe-task-definition --region $AWS_REGION --task-definition "$TT__ECS_TASK_DEFINITION")
+NEW_TASK_DEFINITION=$(echo $TASK_DEFINITION | jq --arg IMAGE "$IMAGE" '.taskDefinition | .containerDefinitions[-1].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+NEW_TASK=$(aws ecs register-task-definition --region $AWS_REGION --cli-input-json "$NEW_TASK_DEFINITION")
+NEW_TASK_REVISION=$(echo $NEW_TASK | jq -r '.taskDefinition.revision')
+
+
+# === Update ECS Service ===
+
+if [[ -n $TT__ECS_SERVICE ]]; then
+	echo -e "${GREEN}Updating ECS Service...${RESET}"
+	aws ecs update-service --region $AWS_REGION --cluster "$TT__ECS_CLUSTER" --service "$TT__ECS_SERVICE" --task-definition "$TT__ECS_TASK_DEFINITION:$NEW_TASK_REVISION" > /dev/null
+	echo -e "${GREEN}All done!${RESET}"
+fi

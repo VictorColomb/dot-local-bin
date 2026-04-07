@@ -1,0 +1,382 @@
+#!/usr/bin/env -S uv run --script
+# -*- coding: utf-8 -*-
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "valkey-glide-sync",
+#     "boto3",
+#     "rich",
+#     "typer",
+# ]
+# ///
+
+__author__ = "Victor COLOMB <victor@tarmactechnologies.com>"
+__copyright__ = "Copyright (c) 2026 Tarmac Technologies"
+
+import json
+import re
+import sys
+import urllib.parse
+import urllib.request
+from typing import Iterable
+
+import boto3
+import botocore.exceptions
+import botocore.model
+import botocore.session
+import botocore.signers
+import typer
+from glide_shared.config import AdvancedGlideClusterClientConfiguration
+from glide_sync import (
+    ClusterScanCursor,
+    GlideClusterClient,
+    GlideClusterClientConfiguration,
+    NodeAddress,
+    ServerCredentials,
+)
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+
+console = Console()
+app = typer.Typer(no_args_is_help=True)
+
+
+# ---------- Get cluster information ----------
+
+
+def get_cluster_host_port(cluster: str) -> tuple[str, int]:
+    ec = boto3.client("elasticache")
+
+    try:
+        response = ec.describe_cache_clusters(CacheClusterId=cluster)
+    except botocore.exceptions.ClientError:
+        try:
+            response = ec.describe_serverless_caches(ServerlessCacheName=cluster)
+        except botocore.exceptions.ClientError:
+            print("ElastiCache cluster not found", file=sys.stderr)
+            raise typer.Exit(3)
+        endpoint = response["ServerlessCaches"][0]["Endpoint"]
+    else:
+        endpoint = response["CacheClusters"][0]["ConfigurationEndpoint"]
+
+    return endpoint["Address"], endpoint["Port"]
+
+
+# ---------- Generate password ----------
+
+
+def get_aws_region_from_idms() -> str:
+    response = urllib.request.urlopen(
+        urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "5"},
+        )
+    )
+    if response.status != 200:
+        print("Could not retrieve IDMS token.", file=sys.stderr)
+        raise typer.Exit(2)
+    token = response.text
+
+    response = urllib.request.urlopen(
+        urllib.request.Request(
+            "http://169.254.169.254/latest/dynamic/instance-identity/document",
+            method="GET",
+            headers={"X-aws-ec2-metadata-token": token},
+        )
+    )
+    if response.status != 200:
+        print("Could not retrieve region from IDMS.", file=sys.stderr)
+        raise typer.Exit(2)
+    region = json.loads(response.text).get("region")
+
+    assert isinstance(region, str)
+    return region
+
+
+def get_aws_region(session: botocore.session.Session) -> str:
+    if (region := session.get_config_variable("region")) is not None:
+        assert isinstance(region, str)
+        return region
+
+    return get_aws_region_from_idms()
+
+
+def generate_iam_token(cluster_name: str, username: str, lifetime: int) -> str:
+    session = botocore.session.get_session()
+    region = get_aws_region(session)
+    credentials = session.get_credentials()
+    assert credentials is not None
+
+    signer = botocore.signers.RequestSigner(
+        service_id=botocore.model.ServiceId("elasticache"),
+        region_name=region,
+        signing_name="elasticache",
+        signature_version="v4",
+        credentials=credentials,
+        event_emitter=session.get_component("event_emitter"),
+    )
+    url = urllib.parse.urlunparse(
+        urllib.parse.ParseResult(
+            scheme="https",
+            netloc=cluster_name,
+            path="/",
+            query=urllib.parse.urlencode({"Action": "connect", "User": username}),
+            params="",
+            fragment="",
+        )
+    )
+
+    signed_url = signer.generate_presigned_url(
+        request_dict={
+            "method": "GET",
+            "url": url,
+            "body": {},
+            "headers": {},
+            "context": {},
+        },
+        operation_name="connect",
+        expires_in=lifetime * 60,
+        region_name=region,
+    )
+    return signed_url.removeprefix("https://")  # type: ignore[no-any-return]
+
+
+# ---------- Valkey GLIDE client helpers ----------
+
+
+def build_client(
+    host: str,
+    port: int,
+    username: str | None,
+    password: str | None,
+) -> GlideClusterClient:
+    addresses = [NodeAddress(host=host, port=port)]
+
+    credentials: ServerCredentials | None = None
+    if password is not None:
+        # ServerCredentials supports username + password for ACL-based auth.
+        credentials = ServerCredentials(password=password, username=username)
+
+    cfg = GlideClusterClientConfiguration(
+        addresses=addresses,
+        credentials=credentials,
+        use_tls=True,
+        request_timeout=1000,
+        advanced_config=AdvancedGlideClusterClientConfiguration(
+            connection_timeout=5000
+        ),
+    )
+    client = GlideClusterClient.create(cfg)
+
+    return client
+
+
+def scan_keys(
+    client: GlideClusterClient,
+    match_glob: str,
+    count: int,
+) -> Iterable[str]:
+    """
+    Yield keys from SCAN.
+
+    Note: cluster-wide SCAN aggregation is a separate GLIDE feature; the sync
+    client does not yet support "Cluster scan" as a first-class API.
+    """
+    cursor = ClusterScanCursor()
+    while True:
+        # Valkey GLIDE exposes standard commands like SCAN via .scan().
+        cursor, keys = client.scan(cursor=cursor, match=match_glob, count=count)
+
+        for k in keys:
+            if isinstance(k, bytes):
+                yield k.decode("utf-8", errors="replace")
+            else:
+                yield str(k)
+
+        if cursor.is_finished():
+            break
+
+
+def delete_batch(
+    client: GlideClusterClient,
+    keys: list[str],
+    dry_run: bool,
+) -> int:
+    if not keys:
+        return 0
+    if dry_run:
+        # Pretend we deleted them, but don't call DEL.
+        return len(keys)
+
+    # DEL returns the number of keys deleted.
+    deleted = client.delete(keys)
+    return int(deleted)
+
+
+def estimate_total_keys(
+    client: GlideClusterClient,
+) -> int | None:
+    """Use DBSIZE to approximate total keys for the progress bar."""
+    try:
+        total = client.dbsize()
+        return int(total)
+    except Exception:
+        return None
+
+
+# ---------- Main deletion logic ----------
+
+
+def delete_matching_keys(
+    client: GlideClusterClient,
+    regex: re.Pattern[str],
+    scan_glob: str,
+    scan_batch: int,
+    delete_batch_size: int,
+    dry_run: bool,
+) -> tuple[int, int]:
+    """
+    Scan all keys, match with regex, delete in batches.
+
+    Returns: (scanned_count, deleted_count)
+    """
+    total_keys_estimate = estimate_total_keys(client)
+
+    scanned = 0
+    deleted = 0
+    pending_delete: list[str] = []
+
+    with Progress(
+        SpinnerColumn(),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task(
+            description="Scanning Valkey keys",
+            total=total_keys_estimate,
+        )
+
+        for key in scan_keys(client, match_glob=scan_glob, count=scan_batch):
+            scanned += 1
+            if total_keys_estimate:
+                progress.advance(task, 1)
+
+            if regex.search(key):
+                pending_delete.append(key)
+
+            if delete_batch_size > 0 and len(pending_delete) >= delete_batch_size:
+                deleted += delete_batch(client, pending_delete, dry_run=dry_run)
+                pending_delete.clear()
+                progress.update(
+                    task, description=f"Scanning & deleting… ({deleted} matched)"
+                )
+
+        # flush remaining deletes
+        if pending_delete:
+            deleted += delete_batch(client, pending_delete, dry_run=dry_run)
+            pending_delete.clear()
+            progress.update(
+                task, description=f"Scanning & deleting… ({deleted} matched)"
+            )
+
+        # If we didn't have an estimate, use scanned count for progress completion.
+        progress.update(task, completed=total_keys_estimate or scanned)
+        progress.refresh()
+
+    return scanned, deleted
+
+
+# ---------- CLI (Typer) ----------
+
+
+@app.command()
+def main(
+    cluster: str = typer.Argument(help="Name of the ElastiCache Valkey cluster"),
+    username: str = typer.Argument(
+        help="Valkey username (ACL user) to pass to ServerCredentials.",
+    ),
+    regex: str = typer.Option(
+        ".*",
+        help="Python regular expression to match keys (e.g. '^user:\\d+:session:').",
+    ),
+    scan_glob: str = typer.Option(
+        "*",
+        "--scan-glob",
+        help="Valkey glob pattern passed to SCAN MATCH to narrow results (default: '*').",
+    ),
+    scan_batch: int = typer.Option(
+        500,
+        "--scan-batch",
+        help="SCAN COUNT value (approximate number of keys per iteration).",
+    ),
+    delete_batch_size: int = typer.Option(
+        1000,
+        "--delete-batch",
+        help="Number of keys to delete in each DEL batch.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Do not delete anything; only count and report matching keys.",
+    ),
+) -> None:
+    """
+    Delete Valkey entries whose key matches a regex, using the GLIDE sync client.
+    """
+
+    # Compile regex
+    try:
+        compiled_regex = re.compile(regex)
+    except re.error as e:
+        console.print(f"[red]Invalid regex:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    # Build GLIDE client
+    host, port = get_cluster_host_port(cluster)
+    password = generate_iam_token(cluster, username, 15)
+
+    client = build_client(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+    )
+
+    console.print(f"[green]Connected to Valkey at {host}:{port}[/green]")
+    console.print(f"Regex: [bold]{regex}[/bold]")
+    console.print(f"SCAN glob: [bold]{scan_glob}[/bold]")
+
+    if dry_run:
+        console.print(
+            "[yellow]Running in DRY-RUN mode (no DEL commands will be sent).[/yellow]"
+        )
+
+    scanned, deleted = delete_matching_keys(
+        client,
+        regex=compiled_regex,
+        scan_glob=scan_glob,
+        scan_batch=scan_batch,
+        delete_batch_size=delete_batch_size,
+        dry_run=dry_run,
+    )
+
+    console.print(
+        f"\n[bold]Scan complete.[/bold] "
+        f"Scanned [cyan]{scanned}[/cyan] keys, "
+        f"{'would delete' if dry_run else 'deleted'} [red]{deleted}[/red] keys."
+    )
+
+
+if __name__ == "__main__":
+    app()

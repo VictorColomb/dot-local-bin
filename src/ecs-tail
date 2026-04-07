@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
+#
+# Author: Victor Colomb <victor@tarmactechnologies.com>
+# Copyright (c) 2026 Tarmac Technologies
+
+## Usage: ecr-build-push [options] <ecs-task-id>
+##
+## Options:
+##	-h|--help:                   Display this help message and exit
+##	-c|--cluster <cluster-name>: ECS cluster name (default: Default)
+##	-j|--jq <filter>:            Filter the output using jq
+##	-s|--since <time>:           Show logs since a given relative or absolute time (default: 10m)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+usage() {
+	[ "$*" ] && echo "$*" && echo
+	sed -n '/^##/,/^$/s/^## \{0,1\}//p' "$0"
+} 2>/dev/null
+
+
+# === Parameters ===
+
+CLUSTER="Default"
+JQ=""
+RETRIES=240  # 20 minutes
+SINCE=""
+
+while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
+	-h | --help)
+		usage "Wait for an ECS task to complete while tailing its logs" 2>&1
+		exit 0
+		;;
+	-c | --cluster)
+		shift; CLUSTER=$1
+		;;
+	-j | --jq)
+		shift; JQ=$1
+		;;
+	-s | --since)
+		shift; SINCE=$1
+		;;
+	*)
+		usage "[!] Unknown option: $1" >&2
+		exit 1
+esac; shift; done
+[[ "$1" == '--' ]] && shift
+
+[[ $# -eq 0 ]] && usage "[!] Missing ecs-task-id" >&2 && exit 1 || TASK="$1"
+
+
+# === Describe Task ===
+
+task_description=$(eval "aws ecs describe-tasks --output json --cluster '$CLUSTER' --tasks '$TASK'")
+
+if [[ "$(echo "$task_description" | jq -r '.failures | length')" -gt 0 ]]; then
+	echo "Could not retrieve task, reason: $(echo "$task_description" | jq -r '.failures[0].reason')" >&2
+	exit 1
+fi
+
+task_arn=$(echo "$task_description" | jq -r '.tasks[0].taskArn')
+task_definition_arn=$(echo "$task_description" | jq -r '.tasks[0].taskDefinitionArn')
+task_id="${task_arn##*/}"
+
+container_definitions=$(eval "aws ecs describe-task-definition --output json --task-definition '$task_definition_arn' --query 'taskDefinition.containerDefinitions'")
+
+
+# === Tail Container Logs ===
+
+pid_tempfile=$(mktemp)
+trap cleanup EXIT
+cleanup() {
+	for pid in $(cat "$pid_tempfile"); do
+		kill -TERM -- "-$pid"
+	done
+	rm -rf "$pid_tempfile"
+	sleep 2
+}
+
+for container in $(echo "$task_description" | jq -c '.tasks[0] | .containers[]'); do
+	container_name=$(echo "$container" | jq -r '.name')
+	container_definition=$(echo "$container_definitions" | jq -c ".[] | select(.name == \"$container_name\")")
+
+	log_group=$(echo "$container_definition" | jq -r '.logConfiguration.options["awslogs-group"]')
+	log_stream_prefix=$(echo "$container_definition" | jq -r '.logConfiguration.options["awslogs-stream-prefix"]')
+	log_stream="$log_stream_prefix/$container_name/$task_id"
+
+	command="aws logs tail '$log_group' --log-stream-names '$log_stream' --format short --follow"
+	[[ -n "$SINCE" ]] && command+=" --since '$SINCE'"
+	command+=" | sed 's/^.\{20\}//'"
+	[[ -n "$JQ" ]] && command+=" | jq -r '$JQ'"
+
+	setsid bash -c "$command"  &
+	pid=$!
+	echo $pid >> "$pid_tempfile"
+done
+
+# === Wait for Task Completion ===
+
+retry_count=0
+while [[ "$retry_count" -lt "$RETRIES" ]]; do
+	sleep 5
+	task_description=$(eval "aws ecs describe-tasks --output json --cluster '$CLUSTER' --tasks '$TASK'")
+	[[ "$(echo "$task_description" | jq -r '.tasks[0].lastStatus')" == "STOPPED" ]] && break
+
+	retry_count=$((retry_count + 1))
+done
+
+if [[ "$retry_count" -eq "$RETRIES" ]]; then
+	echo "Task did not complete within $RETRIES retries"
+	exit 2
+fi
+
+cleanup
+trap - EXIT
+
+# === Get Status Codes ===
+
+failed=0
+declare -A exit_codes
+for container in $(echo "$task_description" | jq -c '.tasks[0] | .containers[]'); do
+	container_name=$(echo "$container" | jq -r '.name')
+	exit_code=$(echo "$container" | jq -r '.exitCode')
+	if [[ "$exit_code" -ne 0 ]]; then
+		exit_codes["$container_name"]="$exit_code"
+		failed=1
+	fi
+done
+
+[[ "$failed" -eq 1 ]] && color='\033[31m' || color='\033[32m'
+width=$(tput cols 2>/dev/null || echo 80)
+printf '%b%*s%b\n' "$color" "$width" "" "\033[0m" | tr ' ' '='
+
+for key in "${!sounds[@]}"; do
+	echo "Container $key failed with exit code ${sounds[$key]}"
+done
+
+[[ "$failed" -eq 1 ]] && exit 3
+echo "Task completed"

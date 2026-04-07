@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
+#
+# Author: Victor Colomb <victor@tarmactechnologies.com>
+# Copyright (c) 2026 Tarmac Technologies
+
+## Usage: git amend [fixup-ref]
+##
+## Options
+##	-h|--help: Display this help message and exit
+
+set -euo pipefail
+IFS=$'\n\t'
+
+usage() {
+	[ "$*" ] && echo "$*" && echo
+	sed -n '/^##/,/^$/s/^## \{0,1\}//p' "$0"
+} 2>/dev/null
+
+
+# === Parameters ===
+
+[[ "$#" -eq 0 ]] && FIXUP="" || FIXUP="$1"
+
+
+# === Main ===
+
+if [[ -z "$FIXUP" ]]; then
+	git commit --amend --no-edit
+else
+	git commit --fixup="$FIXUP"
+	git rebase "$FIXUP^" --autosquash
+fi

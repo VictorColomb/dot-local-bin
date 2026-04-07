@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
+#
+# Author: Victor Colomb <victor@tarmactechnologies.com>
+# Copyright (c) 2026 Tarmac Technologies
+
+## Usage: git main
+##
+## Options
+##	-h|--help:          Display this help message and exit
+##	-b|--branch <name>: Branch to switch to (default: main)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+usage() {
+	[ "$*" ] && echo "$*" && echo
+	sed -n '/^##/,/^$/s/^## \{0,1\}//p' "$0"
+} 2>/dev/null
+
+
+# === Parameters ===
+
+BRANCH="main"
+
+set +u
+while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
+	-h | --help)
+		usage "Switch to the default branch, pull latest version and clean local branches" 2>&1
+		exit 0
+		;;
+	-b | --branch)
+		shift; BRANCH=$1
+		;;
+	*)
+		usage "[!] Unknown option: $1" 2>&1
+		exit 1
+esac; shift; done
+[[ "$1" == '--' ]] && shift
+set -u
+
+
+# === Switch to main ===
+
+if [[ "$(git branch --show-current)" = "$BRANCH" ]]; then
+	git pull
+else
+	git fetch origin "$BRANCH:$BRANCH"
+	git switch "$BRANCH"
+fi
+
+
+# === Clean local branches ===
+
+git fetch -p
+npx git-removed-branches --prune --force
