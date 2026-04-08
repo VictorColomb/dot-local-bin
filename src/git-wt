@@ -9,6 +9,7 @@
 ## Options
 ##	-h|--help:              Display this help message and exit
 ##	-d|--delete:            Delete the specified worktree
+##	-c|--command <cmd>:     Run a bash command in the specified worktree
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -22,6 +23,7 @@ usage() {
 # === Parameters ===
 
 DELETE=0
+COMMAND=""
 
 set +u
 while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
@@ -32,6 +34,10 @@ while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
 		;;
 	-d | --delete)
 		DELETE=1
+		;;
+	-c | --command)
+		shift
+		COMMAND="$1"
 		;;
 	*)
 		usage "[!] Unknown option: $1" 1>&2
@@ -82,8 +88,15 @@ create_worktree() {
 	fi
 }
 
+run_in_worktree() {
+	[[ -d "$1" ]] || { echo "[!] Worktree '$1' not found." >&2; return 1; }
+	(cd "$1" && bash -c "$COMMAND")
+}
+
 process_worktree() {
-	if [[ $DELETE -eq 1 ]]; then
+	if [[ -n "$COMMAND" ]]; then
+		run_in_worktree "$1"
+	elif [[ $DELETE -eq 1 ]]; then
 		delete_worktree "$1"
 	elif git worktree list --porcelain | grep "^worktree " | cut -d ' ' -f 2- | grep -q "^${1}$"; then
 		open_ide "$1"
