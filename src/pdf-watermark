@@ -1,0 +1,160 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#   "pypdf",
+#   "reportlab",
+# ]
+# ///
+
+import argparse
+import io
+import logging
+import sys
+from pathlib import Path
+
+from pypdf import PdfReader, PdfWriter
+from reportlab.lib.colors import Color
+from reportlab.pdfgen import canvas as rl_canvas
+
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+
+
+def make_watermark_bytes(
+    text: str,
+    page_width: float,
+    page_height: float,
+    fontsize: int,
+    alpha: float,
+    angle: float,
+    grey: float,
+) -> bytes:
+    """Return bytes of a single-page PDF containing the watermark."""
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=(page_width, page_height))
+    c.setFillColor(Color(grey, grey, grey, alpha=alpha))
+    c.setFont("Helvetica-Bold", fontsize)
+
+    c.saveState()
+    c.translate(page_width / 2, page_height / 2)
+    c.rotate(angle)
+
+    lines = text.split("\n")
+    line_height = fontsize * 1.4
+    total_height = line_height * (len(lines) - 1)
+    for i, line in enumerate(lines):
+        y = total_height / 2 - i * line_height
+        c.drawCentredString(0, y, line)
+
+    c.restoreState()
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+
+def watermark_pdf(
+    input_path: str,
+    watermark_text: str,
+    output_path: str,
+    fontsize: int = 28,
+    alpha: float = 0.18,
+    angle: float = 40,
+    grey: float = 0.5,
+    background: bool = False,
+) -> None:
+    reader = PdfReader(input_path)
+    writer = PdfWriter()
+
+    for page in reader.pages:
+        pw = float(page.mediabox.width)
+        ph = float(page.mediabox.height)
+        wm_bytes = make_watermark_bytes(
+            watermark_text, pw, ph, fontsize, alpha, angle, grey
+        )
+        wm_page = PdfReader(io.BytesIO(wm_bytes)).pages[0]
+        if background:
+            wm_page.merge_page(page)  # original content on top -> watermark behind
+            writer.add_page(wm_page)
+        else:
+            page.merge_page(wm_page)  # watermark on top -> foreground
+            writer.add_page(page)
+
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+    print(f"✓ Watermarked PDF saved to: {output_path}  ({len(writer.pages)} pages)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Add a diagonal semi-transparent text watermark to a PDF.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("input", help="Path to the input PDF")
+    parser.add_argument("text", help="Watermark text (use \\n for multiple lines)")
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output path (default: <input>_watermarked.pdf)",
+    )
+    parser.add_argument(
+        "-s", "--fontsize", type=int, default=28, help="Font size (default: 28)"
+    )
+    parser.add_argument(
+        "-a",
+        "--alpha",
+        type=float,
+        default=0.18,
+        help="Opacity 0.0–1.0 (default: 0.18)",
+    )
+    parser.add_argument(
+        "-n",
+        "--angle",
+        type=float,
+        default=40,
+        help="Rotation angle in degrees (default: 40)",
+    )
+    parser.add_argument(
+        "-c",
+        "--color",
+        type=float,
+        default=0.5,
+        dest="grey",
+        help="Grey level 0.0–1.0 (default: 0.5)",
+    )
+    parser.add_argument(
+        "-b",
+        "--background",
+        action="store_true",
+        help="Place watermark behind content (default: in front)",
+    )
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        sys.exit(f"Error: file not found: {input_path}")
+
+    output_path = args.output or str(
+        input_path.with_stem(input_path.stem + "_watermarked")
+    )
+    if Path(output_path).resolve() == input_path.resolve():
+        sys.exit("Error: output path must differ from input path")
+
+    # Unescape \n so shell callers can pass multi-line text
+    text = args.text.replace("\\n", "\n")
+
+    watermark_pdf(
+        input_path=str(input_path),
+        watermark_text=text,
+        output_path=output_path,
+        fontsize=args.fontsize,
+        alpha=args.alpha,
+        angle=args.angle,
+        grey=args.grey,
+        background=args.background,
+    )
+
+
+if __name__ == "__main__":
+    main()
