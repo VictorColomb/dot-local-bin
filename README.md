@@ -6,6 +6,7 @@ easily install by moving them into / symlink them from `~/.local/bin`.
 | Executable | Summary |
 | --- | --- |
 | `cloudwatch-tail` | Tail a CloudWatch log group/stream, stripping the timestamp prefix; optionally filter JSON output with a jq expression |
+| `cloudwatch-widget-png` | Render a CloudWatch metric widget JSON definition into a PNG image |
 | `ecr-build-push` | Build a Docker image, push it to ECR (tagged with the current git SHA), register a new ECS task definition revision, and optionally update an ECS service |
 | `ecs-tail` | Tail the CloudWatch logs of all containers in a running ECS task and wait for it to finish, reporting each container's exit code |
 | `elasticache-password` | Generate a short-lived IAM-authenticated password for an ElastiCache Valkey cluster |

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
+#
+# Author: Victor Colomb <victor@tarmactechnologies.com>
+# Copyright (c) 2026 Tarmac Technologies
+
+## Usage: cloudwatch-widget-png [options] [input-file]
+##
+## Options:
+##	-h, --help           Display this help message and exit
+##	-o, --output <file>  Output PNG file, or - for stdout [default: widget.png,
+##	                     suffixed with a number if that file already exists]
+##
+## Reads a CloudWatch metric widget JSON definition from <input-file>
+## (default: stdin) and renders it to a PNG image.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+usage() {
+	[ "$*" ] && echo "$*" && echo
+	sed -n '/^##/,/^$/s/^## \{0,1\}//p' "$0"
+} 2>/dev/null
+
+
+# === Parameters ===
+
+OUTPUT=""
+
+set +u
+while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
+	-h | --help)
+		usage 2>&1
+		exit 0
+		;;
+	-o | --output)
+		shift; OUTPUT=$1
+		;;
+	*)
+		usage "[!] Unknown option: $1" >&2
+		exit 1
+		;;
+esac; shift; done
+[[ "$1" == '--' ]] && shift
+[[ "$#" -eq 0 || "$1" == "-" ]] && INPUT="/dev/stdin" || INPUT="$1"
+set -u
+
+if [[ -z "$OUTPUT" ]]; then
+	OUTPUT="widget.png"
+	n=1
+	while [[ -e "$OUTPUT" ]]; do
+		OUTPUT="widget_$((n++)).png"
+	done
+fi
+
+
+# === Render widget ===
+
+WIDGET=$(cat "$INPUT")
+IMAGE=$(aws cloudwatch get-metric-widget-image --metric-widget "$WIDGET" --query MetricWidgetImage --output text)
+
+if [[ "$OUTPUT" == "-" ]]; then
+	echo "$IMAGE" | base64 -d
+else
+	echo "$IMAGE" | base64 -d > "$OUTPUT"
+fi
