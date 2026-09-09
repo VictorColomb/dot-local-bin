@@ -31,9 +31,9 @@ RESET="\033[0m"
 
 # === Parameters ===
 
-TT__ECS_SERVICE=""
-TT__OVERWRITE=false
-TT__PLATFORM="linux/arm64"
+TT__ECS_SERVICE="${TT__ECS_SERVICE-}"
+TT__OVERWRITE="${TT__OVERWRITE:-false}"
+TT__PLATFORM="${TT__PLATFORM:-linux/arm64}"
 
 set +u
 while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
