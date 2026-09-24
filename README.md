@@ -16,6 +16,7 @@ easily install by moving them into / symlink them from `~/.local/bin`.
 | `pdf-watermark` | Overlay a diagonal semi-transparent text watermark on every page of a PDF |
 | `pg-delete-from-table` | Delete all rows from a PostgreSQL table in configurable batches, with optional primary-key range bounds |
 | `pg-update-table` | Set a column to a fixed value across an entire PostgreSQL table in configurable batches, with optional primary-key range bounds |
+| `redrive-dynamodb-lambda` | Replay current DynamoDB table items to a Lambda function as synthetic stream INSERT events, with partition-key/sort-key filtering and dry-run support |
 | `valkey-flush` | Scan an ElastiCache Valkey cluster and delete all keys whose name matches a regex, with dry-run support |
 
 ## ⬇️ Install

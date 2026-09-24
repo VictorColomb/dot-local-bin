@@ -1,0 +1,259 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "boto3",
+#     "typer",
+# ]
+# ///
+
+__author__ = "Victor COLOMB <victor@tarmactechnologies.com>"
+__copyright__ = "Copyright (c) 2026 Tarmac Technologies"
+
+import itertools
+import json
+import sys
+import time
+import uuid
+from collections.abc import Iterator
+from decimal import Decimal
+from typing import Any
+
+import boto3
+import typer
+
+app = typer.Typer(no_args_is_help=True)
+
+
+# ---------- Table / key schema resolution ----------
+
+
+def describe_source(stream_arn: str) -> tuple[dict, dict]:
+    """Resolve region + table name + key schema + stream view type from the stream ARN."""
+    region = stream_arn.split(":")[3]
+    ddb = boto3.client("dynamodb", region_name=region)
+    streams = boto3.client("dynamodbstreams", region_name=region)
+
+    stream = streams.describe_stream(StreamArn=stream_arn)["StreamDescription"]
+    table_name = stream["TableName"]
+
+    key_schema = {k["KeyType"]: k["AttributeName"] for k in stream["KeySchema"]}
+    attr_types = {
+        a["AttributeName"]: a["AttributeType"]
+        for a in ddb.describe_table(TableName=table_name)["Table"][
+            "AttributeDefinitions"
+        ]
+    }
+
+    return ddb, {
+        "region": region,
+        "table_name": table_name,
+        "partition_key": key_schema["HASH"],
+        "sort_key": key_schema.get("RANGE"),
+        "attr_types": attr_types,
+        "stream_view_type": stream["StreamViewType"],
+    }
+
+
+def typed_value(attr_types: dict, name: str, value: str) -> dict:
+    return {attr_types[name]: value}
+
+
+# ---------- Query / Scan ----------
+
+
+def fetch_items(
+    ddb,
+    info: dict,
+    partition_key: str | None,
+    after: str | None,
+    before: str | None,
+) -> Iterator[dict]:
+    attr_types = info["attr_types"]
+    sort_key = info["sort_key"]
+
+    names = {"#pk": info["partition_key"]}
+    values: dict[str, Any] = {}
+    condition = None
+
+    if partition_key is not None:
+        values[":pk"] = typed_value(attr_types, info["partition_key"], partition_key)
+        condition = "#pk = :pk"
+
+        if sort_key and (after is not None or before is not None):
+            names["#sk"] = sort_key
+            if after is not None and before is not None:
+                values[":after"] = typed_value(attr_types, sort_key, after)
+                values[":before"] = typed_value(attr_types, sort_key, before)
+                condition += " AND #sk BETWEEN :after AND :before"
+            elif after is not None:
+                values[":after"] = typed_value(attr_types, sort_key, after)
+                condition += " AND #sk >= :after"
+            else:
+                values[":before"] = typed_value(attr_types, sort_key, before)
+                condition += " AND #sk <= :before"
+
+        paginator = ddb.get_paginator("query")
+        pages = paginator.paginate(
+            TableName=info["table_name"],
+            KeyConditionExpression=condition,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+            ScanIndexForward=True,  # ascending sort key, so --after can resume a redrive
+        )
+    else:
+        print(
+            "warning: no --partition-key given, scanning entire table "
+            "(Scan does not preserve sort key order, so --after cannot reliably resume)",
+            file=sys.stderr,
+        )
+
+        kwargs: dict[str, Any] = {"TableName": info["table_name"]}
+        if sort_key and (after is not None or before is not None):
+            names = {"#sk": sort_key}
+            if after is not None and before is not None:
+                values = {
+                    ":after": typed_value(attr_types, sort_key, after),
+                    ":before": typed_value(attr_types, sort_key, before),
+                }
+                kwargs["FilterExpression"] = "#sk BETWEEN :after AND :before"
+            elif after is not None:
+                values = {":after": typed_value(attr_types, sort_key, after)}
+                kwargs["FilterExpression"] = "#sk >= :after"
+            else:
+                values = {":before": typed_value(attr_types, sort_key, before)}
+                kwargs["FilterExpression"] = "#sk <= :before"
+            kwargs["ExpressionAttributeNames"] = names
+            kwargs["ExpressionAttributeValues"] = values
+
+        paginator = ddb.get_paginator("scan")
+        pages = paginator.paginate(**kwargs)
+
+    for page in pages:
+        yield from page["Items"]
+
+
+# ---------- Record synthesis + invocation ----------
+
+
+def synthesize_record(info: dict, stream_arn: str, item: dict) -> dict:
+    keys = {info["partition_key"]: item[info["partition_key"]]}
+    if info["sort_key"]:
+        keys[info["sort_key"]] = item[info["sort_key"]]
+
+    return {
+        "eventID": str(uuid.uuid4()),
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": info["region"],
+        "dynamodb": {
+            "ApproximateCreationDateTime": Decimal(str(time.time())),
+            "Keys": keys,
+            "NewImage": item,
+            "SequenceNumber": str(uuid.uuid4().int)[:21],
+            "SizeBytes": len(str(item)),
+            "StreamViewType": info["stream_view_type"],
+        },
+        "eventSourceARN": stream_arn,
+    }
+
+
+def sort_key_value(info: dict, item: dict) -> str | None:
+    if not info["sort_key"]:
+        return None
+    return next(iter(item[info["sort_key"]].values()))
+
+
+def batched(items: Iterator[dict], size: int) -> Iterator[list[dict]]:
+    it = iter(items)
+    while batch := list(itertools.islice(it, size)):
+        yield batch
+
+
+# ---------- CLI ----------
+
+
+@app.command()
+def main(
+    stream_arn: str = typer.Argument(help="ARN of the DynamoDB stream to redrive from"),
+    lambda_function: str = typer.Argument(
+        help="Name or ARN of the Lambda function to invoke"
+    ),
+    partition_key: str | None = typer.Option(
+        None,
+        "--partition-key",
+        help="Restrict to this partition key value (Query); omit to Scan the whole table",
+    ),
+    after: str | None = typer.Option(
+        None, "--after", help="Only records whose sort key is >= this (inclusive)"
+    ),
+    before: str | None = typer.Option(
+        None, "--before", help="Only records whose sort key is <= this (inclusive)"
+    ),
+    batch_size: int = typer.Option(
+        1, "--batch-size", help="Number of records per Lambda invocation"
+    ),
+    rate: float | None = typer.Option(
+        None, "--rate", help="Max Lambda invocations per second (unset = no throttling)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Only report how many items would be redriven"
+    ),
+) -> None:
+    """Replay current DynamoDB table items to a Lambda function as synthetic stream INSERT events."""
+
+    ddb, info = describe_source(stream_arn)
+
+    if (after is not None or before is not None) and info["sort_key"] is None:
+        print(
+            "error: table has no sort key, --after/--before cannot be used",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+
+    if dry_run:
+        items = fetch_items(ddb, info, partition_key, after, before)
+        count = 0
+        for i, batch in enumerate(batched(items, batch_size)):
+            if i == 0:
+                records = [synthesize_record(info, stream_arn, item) for item in batch]
+                print(json.dumps({"Records": records}, default=str, indent=2))
+            count += len(batch)
+        print(f"{count} item(s) matched, {(count + batch_size - 1) // batch_size} invocation(s)")
+        raise typer.Exit(0)
+
+    region = (
+        lambda_function.split(":")[3]
+        if lambda_function.startswith("arn:")
+        else info["region"]
+    )
+    lam = boto3.client("lambda", region_name=region)
+
+    items = fetch_items(ddb, info, partition_key, after, before)
+
+    interval = 1 / rate if rate else 0
+    invoked = 0
+    for batch in batched(items, batch_size):
+        start = time.monotonic()
+
+        records = [synthesize_record(info, stream_arn, item) for item in batch]
+        lam.invoke(
+            FunctionName=lambda_function,
+            InvocationType="Event",
+            Payload=json.dumps({"Records": records}, default=str).encode(),
+        )
+        invoked += len(batch)
+        last_sort_key = sort_key_value(info, batch[-1])
+        suffix = f", last sort key: {last_sort_key}" if last_sort_key is not None else ""
+        print(f"invoked {invoked} so far{suffix}", file=sys.stderr)
+
+        if interval:
+            time.sleep(max(0, interval - (time.monotonic() - start)))
+
+    print(f"done: {invoked} item(s) redriven to {lambda_function}")
+
+
+if __name__ == "__main__":
+    app()
