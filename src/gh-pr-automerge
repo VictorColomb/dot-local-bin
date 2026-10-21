@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
+#
+# Author: Victor Colomb <victor@tarmactechnologies.com>
+# Copyright (c) 2026 Tarmac Technologies
+
+## Usage: gh-pr-automerge [options] [<pr-number> | <pr-url> | <branch>]
+##
+## Options:
+##	-h|--help:                  Display this help message and exit
+##	-R|--repo <owner/repo>:     Select another repository
+##	-m|--merge-method <method>: Merge method to use: merge, squash, rebase (default: derived from repo/branch settings)
+##	-i|--interval <seconds>:    Refresh interval in seconds while watching checks (default: 10)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+usage() {
+	[ "$*" ] && echo "$*" && echo
+	sed -n '/^##/,/^$/s/^## \{0,1\}//p' "$0"
+} 2>/dev/null
+
+resolve_merge_method() {
+	local owner=$1 repo=$2 base=$3
+	local repo_json protection_json allow_merge allow_squash allow_rebase linear_history allowed=()
+
+	repo_json=$(gh api "repos/$owner/$repo" 2>/dev/null) || repo_json='{}'
+	allow_merge=$(echo "$repo_json" | jq -r '.allow_merge_commit // true')
+	allow_squash=$(echo "$repo_json" | jq -r '.allow_squash_merge // true')
+	allow_rebase=$(echo "$repo_json" | jq -r '.allow_rebase_merge // true')
+
+	protection_json=$(gh api "repos/$owner/$repo/branches/$base/protection" 2>/dev/null) || protection_json='{}'
+	linear_history=$(echo "$protection_json" | jq -r '.required_linear_history.enabled // false')
+
+	[[ "$allow_merge" == "true" && "$linear_history" != "true" ]] && allowed+=(merge)
+	[[ "$allow_squash" == "true" ]] && allowed+=(squash)
+	[[ "$allow_rebase" == "true" ]] && allowed+=(rebase)
+
+	if [[ ${#allowed[@]} -eq 1 ]]; then
+		echo "${allowed[0]}"
+	elif [[ "$allow_squash" == "true" ]]; then
+		echo "squash"
+	else
+		echo "merge"
+	fi
+}
+
+
+# === Parameters ===
+
+REPO_ARGS=()
+MERGE_METHOD=""
+INTERVAL=10
+
+set +u
+while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
+	-h | --help)
+		usage "Watch a PR's checks and merge it via the async merge API once they're all green" 2>&1
+		exit 0
+		;;
+	-R | --repo)
+		shift; REPO_ARGS=(-R "$1")
+		;;
+	-m | --merge-method)
+		shift; MERGE_METHOD=$1
+		;;
+	-i | --interval)
+		shift; INTERVAL=$1
+		;;
+	*)
+		usage "[!] Unknown option: $1" >&2
+		exit 1
+esac; shift; done
+[[ "$1" == '--' ]] && shift
+PR="${1:-}"
+set -u
+
+
+# === Resolve PR ===
+
+view_args=("${REPO_ARGS[@]}" --json number,url,baseRefName)
+[[ -n "$PR" ]] && view_args+=("$PR")
+pr_json=$(gh pr view "${view_args[@]}")
+
+pr_number=$(echo "$pr_json" | jq -r '.number')
+pr_url=$(echo "$pr_json" | jq -r '.url')
+base_ref=$(echo "$pr_json" | jq -r '.baseRefName')
+[[ "$pr_url" =~ ^https://[^/]+/([^/]+)/([^/]+)/pull/ ]] || { echo "[!] Could not parse owner/repo from $pr_url" >&2; exit 1; }
+OWNER="${BASH_REMATCH[1]}"
+REPO="${BASH_REMATCH[2]}"
+
+
+# === Determine Merge Method ===
+
+[[ -z "$MERGE_METHOD" ]] && MERGE_METHOD=$(resolve_merge_method "$OWNER" "$REPO" "$base_ref")
+
+
+# === Watch Checks ===
+
+gh pr checks "$pr_number" "${REPO_ARGS[@]}" --watch --interval "$INTERVAL"
+
+
+# === Merge ===
+
+gh api --method PUT "repos/$OWNER/$REPO/pulls/$pr_number/merge-async" -f "merge_method=$MERGE_METHOD"
+
+
+# === Wait For Merge ===
+
+# NOTE: only the PR itself is polled, and a failed async merge is detected by timeout (PR stays OPEN)
+deadline=$((SECONDS + 120))
+while :; do
+	state=$(gh pr view "$pr_number" "${REPO_ARGS[@]}" --json state --jq '.state')
+	case $state in
+		MERGED)
+			echo "[+] PR #$pr_number merged"
+			exit 0
+			;;
+		CLOSED)
+			echo "[!] PR #$pr_number was closed without being merged" >&2
+			exit 3
+			;;
+	esac
+	if ((SECONDS >= deadline)); then
+		echo "[!] Timed out waiting for PR #$pr_number to merge (state: $state), the async merge probably failed: $pr_url" >&2
+		exit 2
+	fi
+	sleep "$INTERVAL"
+done

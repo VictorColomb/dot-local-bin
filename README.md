@@ -10,6 +10,7 @@ easily install by moving them into / symlink them from `~/.local/bin`.
 | `ecr-build-push` | Build a Docker image, push it to ECR (tagged with the current git SHA), register a new ECS task definition revision, and optionally update an ECS service |
 | `ecs-tail` | Tail the CloudWatch logs of all containers in a running ECS task and wait for it to finish, reporting each container's exit code |
 | `elasticache-password` | Generate a short-lived IAM-authenticated password for an ElastiCache Valkey cluster |
+| `gh-pr-automerge` | Watch a GitHub PR's checks and merge it via the async merge API once they're all green |
 | `git-amend` | Amend the latest commit in-place, or create a fixup commit for an older ref and immediately autosquash it |
 | `git-main` | Switch to the main branch, pull the latest changes, and prune stale local branches |
 | `git-wt` | Interactively create, open, or delete git worktrees using fzf; opens the result in Zed or VS Code |
