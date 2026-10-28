@@ -10,6 +10,8 @@
 ##	-h|--help:              Display this help message and exit
 ##	-d|--delete:            Delete the specified worktree
 ##	-c|--command <cmd>:     Run a bash command in the specified worktree
+##
+## Outside VSCode and Zed, opens a nested shell in the worktree.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -52,8 +54,14 @@ set -u
 # === Functions ===
 
 open_ide() {
-	[[ ${TERM_PROGRAM:-} == "vscode" ]] && code --reuse-window "$@"
-	[[ ${ZED_TERM:-} == "true" ]] && zed --reuse "$@"
+	if [[ ${TERM_PROGRAM:-} == "vscode" ]]; then
+		code --reuse-window "$@"
+	elif [[ ${ZED_TERM:-} == "true" ]]; then
+		zed --reuse "$@"
+	else
+		# Bare shell: can't cd the parent, so start a nested one (exit to go back)
+		(cd "$1" && exec "${SHELL:-bash}")
+	fi
 }
 
 delete_worktree() {
@@ -98,17 +106,35 @@ process_worktree() {
 		run_in_worktree "$1"
 	elif [[ $DELETE -eq 1 ]]; then
 		delete_worktree "$1"
-	elif git worktree list --porcelain | grep "^worktree " | cut -d ' ' -f 2- | grep -q "^${1}$"; then
+	elif git worktree list --porcelain | grep "^worktree " | cut -d ' ' -f 2- | grep -qxF -- "$1"; then
 		open_ide "$1"
 	else
 		create_worktree "$1"
 	fi
 }
 
+# Match an existing worktree by full path, last path component or sibling short name
+# (<repo>.<name>); fail if ambiguous, else default to a new sibling path
+resolve_worktree() {
+	local p matches=()
+	while read -r p; do
+		if [[ "$p" == "$1" || "${p##*/}" == "$1" || "$p" == "${worktree_base_dir}$1" ]]; then
+			matches+=("$p")
+		fi
+	done < <(git worktree list --porcelain | grep "^worktree " | cut -d ' ' -f 2- | tail -n +2)
+	if [[ ${#matches[@]} -gt 1 ]]; then
+		echo "[!] '$1' is ambiguous, use the full path:" >&2
+		printf '  %s\n' "${matches[@]}" >&2
+		return 2
+	fi
+	echo "${matches[0]:-${worktree_base_dir}$1}"
+}
+
 prompt_worktree() {
+	# All worktrees but the main one (listed first), by last path component
 	options=$(git worktree list --porcelain | grep "^worktree " \
-		| cut -d ' ' -f 2- \
-		| awk -v base="$worktree_base_dir" '$0 ~ "^" base { sub(base, "", $0); print $0 }')
+		| cut -d ' ' -f 2- | tail -n +2 \
+		| while read -r p; do echo "${p##*/}"; done)
 
 	if [[ $DELETE -eq 0 ]]; then
 		options="-- Main worktree --\n$options"
@@ -154,5 +180,6 @@ fi
 if [[ "$TARGET_NAME" == "-- Main worktree --" ]]; then
 	process_worktree "${parent_dir}/${repo_name}"
 else
-	process_worktree "${worktree_base_dir}${TARGET_NAME}"
+	target_path=$(resolve_worktree "$TARGET_NAME") || exit 2
+	process_worktree "$target_path"
 fi
